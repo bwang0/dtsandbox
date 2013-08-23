@@ -109,6 +109,7 @@ private:
   ///the type (color format) of the video frames, such as VIDEO_COLOR_YUV, etc.
   int inputFrameType;
 
+  ///the cycle where phase changed last
   uint32_t phaseChangeCycle;
   
   /**
@@ -117,6 +118,10 @@ private:
    * would reset.
    */
   cv::Size2i expectedFrameSize;
+
+  ///Detection/Verification on separate thread
+  std::thread mDetectThread;
+  std::mutex objTrackWindowLock;
 
   //helpers for CAMshift tracking
   void histPeakAccent(cv::Mat& hist, int farthestBinFromPeak);

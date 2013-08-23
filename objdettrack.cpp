@@ -26,6 +26,107 @@
 
 namespace BJ {
 
+std::vector<cv::Rect> 
+ObjDetTrack::detTrackRun(const cv::Mat& currframe)
+{
+  //check if the input frames (currframe) changed resolution from the
+  //last time that detTrackSwitch is called. If so, drop past results
+  //and re-detect and then track.
+  if(currframe.size() != expectedFrameSize){
+    detOrTrackFlag = 0;
+    expectedFrameSize = currframe.size();
+  }
+  
+  //check if we have previous frame. If we do not, then save.
+  //optical flow tracking needs previous frame to work.
+  if(previousFrame.empty()){
+    cvtColor(currframe, previousFrame, cv::COLOR_RGB2GRAY);
+    return std::vector<cv::Rect>();
+  }
+  
+  //Choose to perform detection or tracking
+  switch(detOrTrackFlag){
+    
+  case 0: //DETECTION PHASE
+
+    if(numNoObjFrame > 0 && numNoObjFrame%C_MAX_NO_OBJ_THEN_SLEEP_INTERVAL == 0){
+      std::chrono::milliseconds t15frames(1500);
+      std::this_thread::sleep_for(t15frames);
+    }
+    
+    objTrackWindow = haarCascadeDetect(currframe);
+    
+    //if detected any object of interest, then set to tracking phase.
+    if(objTrackWindow.size() > 0){
+      detOrTrackFlag = 1;
+      phaseChangeCycle = cycle;
+
+      objHueHist.clear(); //clear old color histogram
+      objCornerFeat.clear(); //clear old corner features
+      
+      startingWindow = objTrackWindow; //make a backup copy of initial detection windows
+      
+      verifyFailCount.clear();
+      verifyFailCount.insert(verifyFailCount.begin(), objTrackWindow.size(), 0);
+      
+      numNoObjFrame = 0;
+    } else{
+      numNoObjFrame++;
+    }
+    
+    if(detOrTrackFlag == 0) break;
+    //else continue to tracking phase without getting a new frame from video
+    //source. That way with quick movement, you would not use outdated 
+    //detection window to track on new object detection.
+  
+  case 1: //TRACKING PHASE
+
+    //meanShiftTracking(currframe);
+    opticalFlowTracking(currframe);
+    
+    //redo detection if too many cycles passed without a detection phase
+    if((cycle - phaseChangeCycle) > 0 &&
+       (cycle - phaseChangeCycle)%C_REDO_DETECTION_MAX_INTERVAL == 0){
+      std::cout<<"Max tracking interval reached! Redo detection"<<std::endl;
+      detOrTrackFlag = 0;
+      phaseChangeCycle = cycle;
+    }
+
+    //redo detection if tracking window area changed too much or much wider than high
+    //doesn't matter now since I fixed the window size to starting size always
+    for(uint32_t i=0; i<objTrackWindow.size(); i++){
+      if(objTrackWindow[i].area() > startingWindow[i].area() * 6.0
+        || objTrackWindow[i].area() < startingWindow[i].area() / 6.0
+        || objTrackWindow[i].width / objTrackWindow[i].height > 2){
+        detOrTrackFlag = 0;
+        phaseChangeCycle = cycle;
+        break;
+      }
+    }
+    
+    //redo detection if large overlap between tracking window
+    if((cycle - phaseChangeCycle) > 0 &&
+       (cycle - phaseChangeCycle)%C_TRACKING_CHECK_OVERLAP_INTERVAL == 0 && 
+        objTrackWindow.size() > 1){
+      uint32_t num_tracked_objects = objTrackWindow.size();
+      removeOverlapWindows(objTrackWindow, C_TRACKING_OVERLAP_THRESHOLD);
+      if(objTrackWindow.size() < num_tracked_objects){
+        detOrTrackFlag = 0;
+        phaseChangeCycle = cycle;
+        break;
+      }
+    }
+
+    break;
+  }
+
+  cycle++;
+  
+  cvtColor(currframe, previousFrame, cv::COLOR_RGB2GRAY);
+
+  return objTrackWindow;
+}
+
 /**
  * The core functionality (detection+tracking) of ObjDetTrack class. 
  * Pass in sequential frames of a video and perform object detection 
@@ -96,7 +197,8 @@ ObjDetTrack::detTrackSwitch(const cv::Mat& currframe)
     opticalFlowTracking(currframe);
     
     //redo detection if too many cycles passed without a detection phase
-    if((cycle - phaseChangeCycle)%C_REDO_DETECTION_MAX_INTERVAL == 0){
+    if((cycle - phaseChangeCycle) > 0 &&
+       (cycle - phaseChangeCycle)%C_REDO_DETECTION_MAX_INTERVAL == 0){
       std::cout<<"Max tracking interval reached! Redo detection"<<std::endl;
       detOrTrackFlag = 0;
       phaseChangeCycle = cycle;
@@ -129,7 +231,9 @@ ObjDetTrack::detTrackSwitch(const cv::Mat& currframe)
     }
     
     //redo detection if large overlap between tracking window
-    if((cycle - phaseChangeCycle)%C_TRACKING_CHECK_OVERLAP_INTERVAL == 0 && objTrackWindow.size() > 1){
+    if((cycle - phaseChangeCycle) > 0 &&
+       (cycle - phaseChangeCycle)%C_TRACKING_CHECK_OVERLAP_INTERVAL == 0 && 
+        objTrackWindow.size() > 1){
       uint32_t num_tracked_objects = objTrackWindow.size();
       removeOverlapWindows(objTrackWindow, C_TRACKING_OVERLAP_THRESHOLD);
       if(objTrackWindow.size() < num_tracked_objects){
@@ -951,12 +1055,26 @@ cv::Point2f ObjDetTrack::transformPt(cv::Mat affM, cv::Point2f pt)
 }
 
 /**
+ * Handle processing of the detection thread. The main thread does
+ * tracking and a separate thread perform detection to prevent
+ * the expensive detection blocking the entire cv analysis.
+ */
+void ObjDetTrack::processDetectThread()
+{
+  
+}
+
+/**
  * Default constructor
  */
 ObjDetTrack::ObjDetTrack()
 {
   shrinkratio = 1;
+  cycle = 0;
   detOrTrackFlag = 0;
+  expectedFrameSize = cv::Size2i(0,0);
+  
+  mDetectThread = std::thread(&ObjDetTrack::processDetectThread, this);
 }
 
 /**
@@ -971,11 +1089,17 @@ ObjDetTrack::ObjDetTrack(
   int inputFrameTypeInit)
 {
   allcas = newAllCas;
-  shrinkratio = newShrinkRatio;
+  if(newShrinkRatio <= 1 && newShrinkRatio > 0){
+    shrinkratio = newShrinkRatio;
+  } else{
+    shrinkratio = 1;
+  }
   inputFrameType = inputFrameTypeInit;
+  cycle = 0;
   detOrTrackFlag = 0;
-  
   expectedFrameSize = cv::Size2i(0,0);
+
+  mDetectThread = std::thread(&ObjDetTrack::processDetectThread, this);
 }
 
 std::vector<cv::CascadeClassifier> ObjDetTrack::getAllCas()
