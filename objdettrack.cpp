@@ -33,7 +33,6 @@ ObjDetTrack::detTrackRun(const cv::Mat& currframe)
   //last time that detTrackSwitch is called. If so, drop past results
   //and re-detect and then track.
   if(currframe.size() != expectedFrameSize){
-    detOrTrackFlag = 0;
     expectedFrameSize = currframe.size();
   }
   
@@ -44,84 +43,50 @@ ObjDetTrack::detTrackRun(const cv::Mat& currframe)
     return std::vector<cv::Rect>();
   }
   
-  //Choose to perform detection or tracking
-  switch(detOrTrackFlag){
-    
-  case 0: //DETECTION PHASE
+  objTrackWindowLock.lock();
+  if(objTrackWindow.size() == 0){
 
-    if(numNoObjFrame > 0 && numNoObjFrame%C_MAX_NO_OBJ_THEN_SLEEP_INTERVAL == 0){
-      std::chrono::milliseconds t15frames(1500);
-      std::this_thread::sleep_for(t15frames);
+    if(detectWorkingFrameLock.try_lock()){
+      detectWorkingFrame = currframe;
+      detectWorkingFrameLock.unlock();
+      newDetectFrame.notify();
     }
-    
-    objTrackWindow = haarCascadeDetect(currframe);
-    
-    //if detected any object of interest, then set to tracking phase.
-    if(objTrackWindow.size() > 0){
-      detOrTrackFlag = 1;
+
+    objTrackWindowLock.unlock();
+    return std::vector<cv::Rect>();
+  }
+
+  opticalFlowTracking(currframe);
+
+  //redo detection if tracking window area changed too much or much wider than high
+  //doesn't matter now since I fixed the window size to starting size always
+  for(uint32_t i=0; i<objTrackWindow.size(); i++){
+    if(objTrackWindow[i].area() > startingWindow[i].area() * 6.0
+      || objTrackWindow[i].area() < startingWindow[i].area() / 6.0
+      || objTrackWindow[i].width / objTrackWindow[i].height > 2){
+      objTrackWindow.clear();
       phaseChangeCycle = cycle;
-
-      objHueHist.clear(); //clear old color histogram
-      objCornerFeat.clear(); //clear old corner features
-      
-      startingWindow = objTrackWindow; //make a backup copy of initial detection windows
-      
-      verifyFailCount.clear();
-      verifyFailCount.insert(verifyFailCount.begin(), objTrackWindow.size(), 0);
-      
-      numNoObjFrame = 0;
-    } else{
-      numNoObjFrame++;
+      break;
     }
-    
-    if(detOrTrackFlag == 0) break;
-    //else continue to tracking phase without getting a new frame from video
-    //source. That way with quick movement, you would not use outdated 
-    //detection window to track on new object detection.
+  }
   
-  case 1: //TRACKING PHASE
-
-    //meanShiftTracking(currframe);
-    opticalFlowTracking(currframe);
-    
-    //redo detection if too many cycles passed without a detection phase
-    if((cycle - phaseChangeCycle) > 0 &&
-       (cycle - phaseChangeCycle)%C_REDO_DETECTION_MAX_INTERVAL == 0){
-      std::cout<<"Max tracking interval reached! Redo detection"<<std::endl;
-      detOrTrackFlag = 0;
+  //redo detection if large overlap between tracking window
+  if((cycle - phaseChangeCycle) > 0 &&
+     (cycle - phaseChangeCycle)%C_TRACKING_CHECK_OVERLAP_INTERVAL == 0 && 
+      objTrackWindow.size() > 1){
+    uint32_t num_tracked_objects = objTrackWindow.size();
+    removeOverlapWindows(objTrackWindow, C_TRACKING_OVERLAP_THRESHOLD);
+    if(objTrackWindow.size() < num_tracked_objects){
+      objTrackWindow.clear();
       phaseChangeCycle = cycle;
+      break;
     }
-
-    //redo detection if tracking window area changed too much or much wider than high
-    //doesn't matter now since I fixed the window size to starting size always
-    for(uint32_t i=0; i<objTrackWindow.size(); i++){
-      if(objTrackWindow[i].area() > startingWindow[i].area() * 6.0
-        || objTrackWindow[i].area() < startingWindow[i].area() / 6.0
-        || objTrackWindow[i].width / objTrackWindow[i].height > 2){
-        detOrTrackFlag = 0;
-        phaseChangeCycle = cycle;
-        break;
-      }
-    }
-    
-    //redo detection if large overlap between tracking window
-    if((cycle - phaseChangeCycle) > 0 &&
-       (cycle - phaseChangeCycle)%C_TRACKING_CHECK_OVERLAP_INTERVAL == 0 && 
-        objTrackWindow.size() > 1){
-      uint32_t num_tracked_objects = objTrackWindow.size();
-      removeOverlapWindows(objTrackWindow, C_TRACKING_OVERLAP_THRESHOLD);
-      if(objTrackWindow.size() < num_tracked_objects){
-        detOrTrackFlag = 0;
-        phaseChangeCycle = cycle;
-        break;
-      }
-    }
-
-    break;
   }
 
   cycle++;
-  
+
+  objTrackWindowLock.unlock();
+
   cvtColor(currframe, previousFrame, cv::COLOR_RGB2GRAY);
 
   return objTrackWindow;
@@ -599,11 +564,11 @@ ObjDetTrack::camShiftTracking(const cv::Mat& currframe)
       objHueHist.push_back(cv::Mat());
       calcHist(&roi, 1, &ch, maskroi, objHueHist[i], 1, &hsize, &phranges);
       
-#if DETTRACK_DEBUG
+      #if DETTRACK_DEBUG
       //display color histogram before suppressing non-peak bins
       normalize(objHueHist[i], objHueHist[i], 0, 255, cv::NORM_MINMAX);
       displayColorHist("1", hsize, objHueHist[i]);
-#endif
+      #endif
 
       //blue people suppression
       thereisnobluepeople(objHueHist[i]);
@@ -611,10 +576,10 @@ ObjDetTrack::camShiftTracking(const cv::Mat& currframe)
       histPeakAccent(objHueHist[i], farthestBinFromPeak);
       normalize(objHueHist[i], objHueHist[i], 0, 255, cv::NORM_MINMAX);
 
-#if DETTRACK_DEBUG
+      #if DETTRACK_DEBUG
       //display color histogram after suppressing non-peak bins
       displayColorHist("2", hsize, objHueHist[i]);
-#endif
+      #endif
     }
   }
  
@@ -1061,7 +1026,21 @@ cv::Point2f ObjDetTrack::transformPt(cv::Mat affM, cv::Point2f pt)
  */
 void ObjDetTrack::processDetectThread()
 {
-  
+  while(1){
+    std::unique_lock<std::mutex> wrapperLock(detectWorkingFrameLock, std::defer_lock);
+
+    do {
+      newDetectFrame.wait(wrapperLock);
+    } while();
+
+    detectWorkingFrameLock.lock();
+    std::vector<cv::Rect> detResult = haarCascadeDetect(detectWorkingFrame);
+    detectWorkingFrameLock.unlock();
+
+    objTrackWindowLock.lock();
+    
+    objTrackWindowLock.unlock();
+  }
 }
 
 /**
@@ -1085,7 +1064,7 @@ ObjDetTrack::ObjDetTrack()
  */
 ObjDetTrack::ObjDetTrack(
   std::vector<cv::CascadeClassifier> newAllCas, 
-  double newShrinkRatio, 
+  double newShrinkRatio,
   int inputFrameTypeInit)
 {
   allcas = newAllCas;
